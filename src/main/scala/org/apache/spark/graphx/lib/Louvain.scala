@@ -15,6 +15,10 @@ object Louvain extends Serializable {
   private var currentIter: Int = 0
   private var totWeight: Float = 0
 
+  private def genRandNum(seed: Int): Int = {
+    (48271 * seed) %  255
+  }
+
   private def modularity(graph: Graph[VertexState, Int], norm: Float): Float = {
     graph.mapTriplets[Float](
       (edge: EdgeTriplet[VertexState, Int]) =>
@@ -32,32 +36,13 @@ object Louvain extends Serializable {
           val vertexState = new VertexState()
           vertexState.degree = degOpt.getOrElse(0)
           vertexState.numEdges2CurrentCommunity = 0
+          vertexState.randNum = genRandNum(vid.toInt)
           vertexState.currentCommunityInfo = CommunityInfo(vid)
           vertexState.currentCommunityInfo.numEdges = 0
           vertexState.currentCommunityInfo.totalDegree = degOpt.getOrElse(0)
           vertexState
         }
       )
-  }
-
-  /**
-   * 为同一个社区内的边两端的顶点指定flag，在一轮迭代中，
-   * 边的两个顶点，至多只有一个能够从当前社区中剥离出去，
-   * 避免出现社区度数或边数更新错误
-   */
-  private def assignFlag(ec: EdgeContext[VertexState, Int, (Int, Int)]): Unit = {
-//    if (ec.srcAttr.currentCommunityInfo.communityId == ec.dstAttr.currentCommunityInfo.communityId) {
-      if (currentIter % 2 == 0) {
-        ec.sendToSrc(0)
-        ec.sendToDst(1)
-      }
-      else {
-        ec.sendToSrc(1)
-        ec.sendToDst(0)
-      }
-//    }
-//    ec.sendToSrc((0, 1))
-//    ec.sendToDst((1, 1))
   }
 
   /**
@@ -69,46 +54,22 @@ object Louvain extends Serializable {
    */
   private def sendMsg(ec: EdgeContext[VertexState, Int, Set[CommunityInfo]]): Unit = {
     if (ec.srcAttr.currentCommunityInfo.communityId != ec.dstAttr.currentCommunityInfo.communityId) {
-//      println("VERTICES %s AND %s ARE IN DIFFERENT COMMUNITIES: %s AND %s".format(
-//        ec.srcId, ec.dstId, ec.srcAttr.currentCommunityInfo.communityId, ec.dstAttr.currentCommunityInfo.communityId
-//      ))
-//      currentIter % 2 match {
-//        // odd -> even
-//        case 0 =>
-//          if (ec.srcAttr.currentCommunityInfo.communityId % 2 == 1 && ec.dstAttr.currentCommunityInfo.communityId % 2 == 0)
-//            ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))
-//          else if (ec.srcAttr.currentCommunityInfo.communityId % 2 == 0 && ec.dstAttr.currentCommunityInfo.communityId % 2 == 1)
-//            ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))
-//        // even -> odd
-//        case 1 =>
-//          if (ec.srcAttr.currentCommunityInfo.communityId % 2 == 1 && ec.dstAttr.currentCommunityInfo.communityId % 2 == 0)
-//            ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))
-//          else if (ec.srcAttr.currentCommunityInfo.communityId % 2 == 0 && ec.dstAttr.currentCommunityInfo.communityId % 2 == 1)
-//            ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))
-//        case _ => Unit
-//      }
-      // even iteration, low --> high
-      if (currentIter % 2 == 0) {
-        if (ec.srcAttr.flag == 0) ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))
-//        if (ec.srcAttr.currentCommunityInfo.communityId < ec.dstAttr.currentCommunityInfo.communityId)
-//          {if(ec.srcAttr.flag==1) ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))} // dst invite src join it's community
-//        else
-//          {if(ec.dstAttr.flag==1) ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))} // src invite dst join it's community
-      }
-      // odd iteration, high --> low
-      else {
-        if (ec.dstAttr.flag == 1) ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))
-//        if (ec.srcAttr.currentCommunityInfo.communityId < ec.dstAttr.currentCommunityInfo.communityId)
-//          {if(ec.dstAttr.flag==1) ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))} // src invite dst join it's community
-//        else
-//          {if(ec.srcAttr.flag==1) ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))} // dst invite src join it's community
+      currentIter % 2 match {
+        // odd -> even
+        case 0 =>
+          if (ec.srcAttr.randNum % 2 == 1 && ec.dstAttr.randNum % 2 == 0)
+            ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))
+          else if (ec.srcAttr.randNum % 2 == 0 && ec.dstAttr.randNum % 2 == 1)
+            ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))
+        // even -> odd
+        case 1 =>
+          if (ec.srcAttr.randNum % 2 == 1 && ec.dstAttr.randNum % 2 == 0)
+            ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))
+          else if (ec.srcAttr.randNum % 2 == 0 && ec.dstAttr.randNum % 2 == 1)
+            ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))
+        case _ => Unit
       }
     }
-//    else {
-//      println("VERTICES %s AND %s ARE IN SAME COMMUNITY: %s".format(
-//        ec.srcId, ec.dstId, ec.srcAttr.currentCommunityInfo.communityId
-//      ))
-//    }
   }
 
   /**
@@ -139,16 +100,6 @@ object Louvain extends Serializable {
       mapMerged.toMap
     }
     graph.aggregateMessages[Map[VertexId, Int]](sendWeight, mergeWeight)
-//    graph.collectNeighbors(EdgeDirection.Either).mapValues {
-//      (neighbors: Array[(VertexId, VertexState)]) => {
-//        val map = mutable.Map[VertexId, Int]()
-//        neighbors.foreach{
-//          (x: (VertexId, VertexState)) =>
-//            map.put(x._2.currentCommunityInfo.communityId, map.getOrElse(x._2.currentCommunityInfo.communityId, 0)+1)
-//        }
-//        map.toMap
-//      }
-//    }
   }
 
   // 添加顶点与各个社区的连边数
@@ -210,15 +161,10 @@ object Louvain extends Serializable {
     (vd.degree, numEdges2Community, optimalCommunity, communityInfoUpdate)
   }
 
-  def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
+  private def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
     totWeight = graph.edges.map(e=>e.attr).reduce(_+_).toFloat
     currentIter = 1
-    val cmGraph: Graph[VertexState, Int] = initCommunityGraph(graph)
-    val flagRdd: VertexRDD[Int] = cmGraph.aggregateMessages[(Int, Int)](
-      assignFlag,
-      (x1, x2) => (x1._1+x2._1, x1._2+x2._2)
-    ).mapValues(x=>{val avg: Float = 1.0f*x._1/x._2; if (avg > .0f && avg < 1.0f) -1 else avg.toInt})
-    cmGraph.outerJoinVertices(flagRdd)((vid, vd, u)=> {vd.flag = if(u.isDefined) u.get else -1; vd}).cache()
+    initCommunityGraph(graph).cache()
   }
   /**
    * run louvain stage#1
@@ -228,7 +174,7 @@ object Louvain extends Serializable {
    * @param minDeltaQ 每轮迭代Q的最小增加值
    * @return 新的社区划分
    */
-  def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
+  private def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
 
     val toArray = (m: Map[VertexId, (Int, Int)]) => m.toArray
 
@@ -254,7 +200,7 @@ object Louvain extends Serializable {
         // (degree, numEdges, communityId, communityId -> (deltaDegree, deltaNumEdges))
         val intermediateGraph: Graph[(Int, Int, VertexId, Option[Map[VertexId, (Int, Int)]]), Int] =
         currentGraph.outerJoinVertices(msgRddWithNumEdges)(selectCommunity).cache()
-        println(intermediateGraph.vertices.filter(x => x._1 != x._2._3).count()+" vertices was assigned new community")
+        println(intermediateGraph.vertices.filter(x => x._2._4.isDefined).count()+" vertices was assigned new community")
         // 按照新的社区划分方案，各个社区信息的更新
         // (communityId, (deltaDegree, deltaNumEdges))
         val communityInfoUpdateRdd: RDD[(VertexId, (Int, Int))] =  intermediateGraph.vertices.filter(
@@ -294,15 +240,15 @@ object Louvain extends Serializable {
         // 关联社区的总度数和总边数
         val vertexCommunityInfoRdd: RDD[(VertexId, CommunityInfo)] =
           newGraph.vertices.map(x => (x._2.currentCommunityInfo.communityId, x._1)).join(newCommunityInfo).map(
-          (x: (VertexId, (VertexId, CommunityInfo))) => {
-            x._2
-          }
+          _._2
         )
         newGraph = newGraph.outerJoinVertices(
           newGraph.vertices.aggregateUsingIndex(vertexCommunityInfoRdd, (v1: CommunityInfo, v2: CommunityInfo) => v1)
         )(
           (vid, vd, u) => {
             if (u.isDefined) vd.currentCommunityInfo = u.get
+            // 更新随机数
+            vd.randNum = genRandNum(vd.randNum)
             vd
           }
         )
