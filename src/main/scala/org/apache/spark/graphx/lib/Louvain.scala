@@ -141,7 +141,7 @@ object Louvain extends Serializable {
    * @return （顶点的度，顶点与新社区的连边数，新社区的id）
    */
   private def selectCommunity(vid: VertexId, vd: VertexState, u: Option[(Set[CommunityInfo], Map[VertexId, Int])]):
-  (VertexId, Int) = {
+  (VertexId, Int, Boolean) = {
     var optimalCommunity: VertexId = vd.currentCommunityInfo.communityId
     if (u.isDefined) {
       var maxQ: Float = .0f
@@ -158,7 +158,7 @@ object Louvain extends Serializable {
         }
       }
     }
-    (optimalCommunity, vd.degree)
+    (optimalCommunity, vd.degree, optimalCommunity!=vd.currentCommunityInfo.communityId)
   }
 
   private def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
@@ -180,9 +180,9 @@ object Louvain extends Serializable {
 
     var currentGraph: Graph[VertexState, Int] = cmGraph
     var newGraph: Graph[VertexState, Int] = null
-    val loop = new Breaks
+    val loopInner = new Breaks
     var currentModularity: Float = modularity(currentGraph, totWeight)
-    loop.breakable {
+    loopInner.breakable {
       while (currentIter <= maxIter) {
         val msgRdd: VertexRDD[Set[CommunityInfo]] = currentGraph.aggregateMessages[Set[CommunityInfo]](sendMsg, _++_).cache()
         // VD: Map[VertexId, Int], communityId -> numEdges
@@ -196,10 +196,13 @@ object Louvain extends Serializable {
           numEdgesVertices2Community
         )((vid, vd, u) => (vd, u))
         msgRdd.unpersist(false)
+        // 临时结果，包括顶点分配的新社区、顶点的度以及顶点的社区是否改变
+        // VD: (VertexId, Int, Boolean) : (communityId, vertexDegree, isChanged)
+        val tmpGraph: Graph[(VertexId, Int, Boolean), Int] = currentGraph.outerJoinVertices(msgRddWithNumEdges)(selectCommunity)
+        println(tmpGraph.vertices.filter(x=>x._2._3).count() + " vertices will update communities")
         // 中间结果，包括顶点分配的新社区、顶点的度
         // VD: (VertexId, Int) : (communityId, vertexDegree)
-        val intermediateGraph: Graph[(VertexId, Int), Int] =
-        currentGraph.outerJoinVertices(msgRddWithNumEdges)(selectCommunity).cache()
+        val intermediateGraph: Graph[(VertexId, Int), Int] = tmpGraph.mapVertices((vid, vd)=>(vd._1, vd._2)).cache()
         // 社区的总度数
         val totDegreePerCommunity: RDD[(VertexId, Int)] = intermediateGraph.vertices.values.reduceByKey(_+_)
         // 社区内的连边数
@@ -235,14 +238,10 @@ object Louvain extends Serializable {
         println("current iteration: "+currentIter+", modularity: "+newModularity)
         if (newModularity < currentModularity + minDeltaQ) {
           println("MODULARITY NOT IMPROVE, BREAK LOOP")
-          loop.break
+          loopInner.break
         }
         currentModularity = newModularity
-        println(currentGraph.vertices.innerJoin(
-          newGraph.vertices
-        )(
-          (vid, vd, u) => vd.currentCommunityInfo.communityId != u.currentCommunityInfo.communityId
-        ).filter(x=>x._2).count() + " vertices changed communities")
+
         currentGraph = newGraph
 
         currentIter += 1
@@ -255,10 +254,26 @@ object Louvain extends Serializable {
 //
 //  }
 
-  def run[VD: ClassTag](graph: Graph[VD, Int], maxIterStage1: Int, minDeltaQStage1: Float)
+  def run[VD: ClassTag](graph: Graph[VD, Int], maxIter: Int, minDeltaQ: Float,
+                        maxIterStage1: Int, minDeltaQStage1: Float)
   : Graph[VertexState, Int] = {
     var cmGraph: Graph[VertexState, Int] = initLouvain(graph)
-    cmGraph = stage1(cmGraph, maxIterStage1, minDeltaQStage1)
+    var vertexCommunity: RDD[(VertexId, VertexId)] = cmGraph.vertices.map(x => (x._1, x._2.currentCommunityInfo.communityId))
+    var iter: Int = 1
+    val loopOuter = new Breaks
+    loopOuter.breakable{
+      while (iter <= maxIter) {
+        cmGraph = stage1(cmGraph, maxIterStage1, minDeltaQStage1)
+        vertexCommunity = vertexCommunity.map(
+          x=>(x._2, x._1)
+        ).leftOuterJoin[VertexId](
+          cmGraph.vertices.map(x=>(x._1, x._2.currentCommunityInfo.communityId))
+        ).map(x=>(x._2._1, x._2._2.getOrElse(-1L)))
+
+        iter += 1
+      }
+    }
+
     cmGraph
   }
 }
