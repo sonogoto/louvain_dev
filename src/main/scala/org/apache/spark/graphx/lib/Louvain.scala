@@ -35,7 +35,7 @@ object Louvain extends Serializable {
         (vid, _, degOpt) => {
           val vertexState = new VertexState()
           vertexState.degree = degOpt.getOrElse(0)
-          vertexState.numEdges2CurrentCommunity = 0
+//          vertexState.numEdges2CurrentCommunity = 0
           vertexState.randNum = genRandNum(vid.toInt)
           vertexState.currentCommunityInfo = CommunityInfo(vid)
           vertexState.currentCommunityInfo.numEdges = 0
@@ -111,17 +111,24 @@ object Louvain extends Serializable {
     numEdges.toSet
   }
 
-  private def deltaQ(originalState: VertexState, targetCom: (CommunityInfo, Int)): Float = {
+  private def getNumEdgesWithinCommunity(graph: Graph[(VertexId, Int), Int]): RDD[(VertexId, Int)] = {
+    val sendEdgeAttr = (ec: EdgeContext[(VertexId, Int), Int, (VertexId, Int)]) => {
+      if (ec.srcAttr._1 == ec.dstAttr._1) ec.sendToSrc((ec.srcAttr._1, ec.attr))
+    }
+    graph.aggregateMessages[(VertexId, Int)](sendEdgeAttr, (x1, x2) => (x1._1, x1._2+x2._2)).values.reduceByKey(_+_)
+  }
+
+  private def deltaQ(originalState: VertexState, targetCom: CommunityInfo, numEdges: Map[VertexId, Int]): Float = {
     // deltaQ1：顶点从原社区剥离之后，原社区Q的变化
     // deltaQ1 = sum_{j in community}(degree_{j})*degree_{i}/totWeight - numEdges_{i} - degree_{i}*degree_{i}/(2*totWeight)
     val deltaQ1: Float = originalState.currentCommunityInfo.totalDegree*originalState.degree/totWeight -
-      originalState.numEdges2CurrentCommunity -
+      numEdges.getOrElse(originalState.currentCommunityInfo.communityId, 0) -
       originalState.degree*originalState.degree/(2*totWeight)
     // deltaQ2：顶点加入新社区之后，新社区Q的变化
     // deltaQ2 = numEdges_{i} - degree_{i}*degree_{i}/(2*totWeight) - sum_{j in community}(degree_{j})*degree_{i}/totWeight
-    val deltaQ2: Float = targetCom._2 -
+    val deltaQ2: Float = numEdges.getOrElse(targetCom.communityId, 0) -
       originalState.degree*originalState.degree/(2*totWeight) -
-      targetCom._1.totalDegree*originalState.degree/totWeight
+      targetCom.totalDegree*originalState.degree/totWeight
     deltaQ1 + deltaQ2
   }
 
@@ -133,32 +140,25 @@ object Louvain extends Serializable {
    * @param u 当前顶点接收的消息，各个社区的信息，以及当前顶点与该社区的连边数
    * @return （顶点的度，顶点与新社区的连边数，新社区的id）
    */
-  private def selectCommunity(vid: VertexId, vd: VertexState, u: Option[Set[(CommunityInfo, Int)]]):
-  (Int, Int, VertexId, Option[Map[VertexId, (Int, Int)]]) = {
+  private def selectCommunity(vid: VertexId, vd: VertexState, u: Option[(Set[CommunityInfo], Map[VertexId, Int])]):
+  (VertexId, Int) = {
     var optimalCommunity: VertexId = vd.currentCommunityInfo.communityId
-    var numEdges2Community: Int = vd.numEdges2CurrentCommunity
-    val map = mutable.Map[VertexId, (Int, Int)]()
     if (u.isDefined) {
       var maxQ: Float = .0f
       var q: Float = .0f
-      u.get.foreach{
+      val numEdgesMap: Map[VertexId, Int] = u.get._2
+      u.get._1.foreach{
         x => {
-          q = deltaQ(vd, x)
+          q = deltaQ(vd, x, numEdgesMap)
 //          println("vid: "+vid+", deltaQ: "+q+", target community: "+x._1+", numEdges to target community: "+x._2)
           if (q > maxQ) {
             maxQ = q
-            optimalCommunity = x._1.communityId
-            numEdges2Community = x._2
+            optimalCommunity = x.communityId
           }
         }
       }
     }
-    if (optimalCommunity != vd.currentCommunityInfo.communityId) {
-      map.put(optimalCommunity, (vd.degree, numEdges2Community))
-      map.put(vd.currentCommunityInfo.communityId, (-vd.degree, -vd.numEdges2CurrentCommunity))
-    }
-    val communityInfoUpdate: Option[Map[VertexId, (Int, Int)]] = if (map.nonEmpty) Option(map.toMap) else None
-    (vd.degree, numEdges2Community, optimalCommunity, communityInfoUpdate)
+    (optimalCommunity, vd.degree)
   }
 
   private def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
@@ -192,62 +192,39 @@ object Louvain extends Serializable {
         )
         // 发送到各个顶点上的消息，包括计算deltaQ所需要的信息
         // VD: Set[(CommunityInfo, Int)], (communityInfo, numEdges)
-        val msgRddWithNumEdges: VertexRDD[Set[(CommunityInfo, Int)]] = msgRdd.innerJoin(numEdgesVertices2Community)(addNumEdges)
+        val msgRddWithNumEdges: VertexRDD[(Set[CommunityInfo], Map[VertexId, Int])] = msgRdd.innerJoin(
+          numEdgesVertices2Community
+        )((vid, vd, u) => (vd, u))
         msgRdd.unpersist(false)
-        // 中间结果，包括顶点分配的新社区、与新社区之间的连边数，以及，顶点加入新社区后，
-        // 对原社区/新社区的总度数和总边数的影响
-        // VD: (Int, Int, VertexId, Option[Map[VertexId, (Int, Int)]])
-        // (degree, numEdges, communityId, communityId -> (deltaDegree, deltaNumEdges))
-        val intermediateGraph: Graph[(Int, Int, VertexId, Option[Map[VertexId, (Int, Int)]]), Int] =
+        // 中间结果，包括顶点分配的新社区、顶点的度
+        // VD: (VertexId, Int) : (communityId, vertexDegree)
+        val intermediateGraph: Graph[(VertexId, Int), Int] =
         currentGraph.outerJoinVertices(msgRddWithNumEdges)(selectCommunity).cache()
-        println(intermediateGraph.vertices.filter(x => x._2._4.isDefined).count()+" vertices was assigned new community")
-        // 按照新的社区划分方案，各个社区信息的更新
-        // (communityId, (deltaDegree, deltaNumEdges))
-        val communityInfoUpdateRdd: RDD[(VertexId, (Int, Int))] =  intermediateGraph.vertices.filter(
-          x => x._2._4.isDefined
-        ).map(x=>x._2._4.get).flatMap(
-          x => toArray(x)
-        ).reduceByKey((x1, x2) => (x1._1+x2._1, x1._2+x2._2)).cache()
-        // 如果没有社区信息更新，则退出迭代
-        if (communityInfoUpdateRdd.count() <= 0) {
-          println("NO COMMUNITY UPDATE, BREAK LOOP")
-          loop.break
-        }
-        // 更新后的社区信息
-        val newCommunityInfo: RDD[(VertexId, CommunityInfo)] = currentGraph.vertices.map(
-          x => (x._2.currentCommunityInfo.communityId,
-            (x._2.currentCommunityInfo.totalDegree, x._2.currentCommunityInfo.numEdges))
-        ).join(communityInfoUpdateRdd).map(
-          (x: (VertexId, ((Int, Int), (Int, Int)))) => {
-            val communityInfo = CommunityInfo(x._1)
-            communityInfo.totalDegree = x._2._1._1 + x._2._2._1
-            communityInfo.numEdges = x._2._1._2 + x._2._2._2
-            (x._1, communityInfo)
+        // 社区的总度数
+        val totDegreePerCommunity: RDD[(VertexId, Int)] = intermediateGraph.vertices.values.reduceByKey(_+_)
+        // 社区内的连边数
+        val numEdgesWithinCommunity: RDD[(VertexId, Int)] = getNumEdgesWithinCommunity(intermediateGraph)
+        // 社区的总度数和社区内的连边数
+        val communityInfo: RDD[(VertexId, CommunityInfo)] = totDegreePerCommunity.leftOuterJoin(
+          numEdgesWithinCommunity
+        ).map(
+          x => {
+            val cInfo: CommunityInfo = CommunityInfo(x._1)
+            cInfo.totalDegree = x._2._1
+            cInfo.numEdges = x._2._2.getOrElse(0)
+            (x._1, cInfo)
           }
         )
-        communityInfoUpdateRdd.unpersist(false)
-        // 为顶点分配新的社区id以及与此社区的连边数
-        newGraph = currentGraph.outerJoinVertices(intermediateGraph.vertices)(
-          (vid, vd, u) => {
-            if (u.isDefined) {
-              vd.numEdges2CurrentCommunity = u.get._2
-              vd.currentCommunityInfo = CommunityInfo(u.get._3)
-            }
-            vd
-          }
-        ).cache()
-        intermediateGraph.unpersist(false)
-        // 关联社区的总度数和总边数
-        val vertexCommunityInfoRdd: RDD[(VertexId, CommunityInfo)] =
-          newGraph.vertices.map(x => (x._2.currentCommunityInfo.communityId, x._1)).join(newCommunityInfo).map(
-          _._2
-        )
-        newGraph = newGraph.outerJoinVertices(
-          newGraph.vertices.aggregateUsingIndex(vertexCommunityInfoRdd, (v1: CommunityInfo, v2: CommunityInfo) => v1)
+        val vertexCommunityInfo: RDD[(VertexId, CommunityInfo)] = intermediateGraph.vertices.map(
+          x => (x._2._1, x._1)
+        ).join(communityInfo).map(x => x._2)
+        intermediateGraph.unpersist()
+        // 为顶点分配新的社区id
+        newGraph = currentGraph.outerJoinVertices(
+          currentGraph.vertices.aggregateUsingIndex(vertexCommunityInfo, (x1: CommunityInfo, x2: CommunityInfo) => x1)
         )(
           (vid, vd, u) => {
             if (u.isDefined) vd.currentCommunityInfo = u.get
-            // 更新随机数
             vd.randNum = genRandNum(vd.randNum)
             vd
           }
@@ -261,6 +238,11 @@ object Louvain extends Serializable {
           loop.break
         }
         currentModularity = newModularity
+        println(currentGraph.vertices.innerJoin(
+          newGraph.vertices
+        )(
+          (vid, vd, u) => vd.currentCommunityInfo.communityId != u.currentCommunityInfo.communityId
+        ).filter(x=>x._2).count() + " vertices changed communities")
         currentGraph = newGraph
 
         currentIter += 1
