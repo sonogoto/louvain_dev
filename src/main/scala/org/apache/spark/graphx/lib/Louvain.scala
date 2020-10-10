@@ -161,9 +161,9 @@ object Louvain extends Serializable {
     (optimalCommunity, vd.degree, optimalCommunity!=vd.currentCommunityInfo.communityId)
   }
 
-  private def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
+  def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
     totWeight = graph.edges.map(e=>e.attr).reduce(_+_).toFloat
-    currentIter = 1
+
     initCommunityGraph(graph).cache()
   }
   /**
@@ -174,9 +174,9 @@ object Louvain extends Serializable {
    * @param minDeltaQ 每轮迭代Q的最小增加值
    * @return 新的社区划分
    */
-  private def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
+   def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
 
-    val toArray = (m: Map[VertexId, (Int, Int)]) => m.toArray
+    currentIter = 1
 
     var currentGraph: Graph[VertexState, Int] = cmGraph
     var newGraph: Graph[VertexState, Int] = null
@@ -235,9 +235,10 @@ object Louvain extends Serializable {
         newGraph = GraphImpl(newGraph.vertices, newGraph.edges).cache()
 
         val newModularity: Float = modularity(newGraph, totWeight)
-        println("current iteration: "+currentIter+", modularity: "+newModularity)
+        println("current INNER iteration: "+currentIter+", modularity: "+newModularity)
         if (newModularity < currentModularity + minDeltaQ) {
-          println("MODULARITY NOT IMPROVE, BREAK LOOP")
+          println("MODULARITY NOT IMPROVE, BREAK INNER LOOP")
+          currentGraph = GraphImpl(currentGraph.vertices, currentGraph.edges).cache()
           loopInner.break
         }
         currentModularity = newModularity
@@ -250,30 +251,52 @@ object Louvain extends Serializable {
     currentGraph
   }
 
-//  def stage2(graph: Graph[VertexState, Int]): Graph[VertexState, Int] = {
-//
-//  }
+  def stage2(graph: Graph[VertexState, Int]): Graph[VertexState, Int] = {
+    val vertexRdd: RDD[(VertexId, VertexState)] = graph.vertices.map(
+      x => x._2.currentCommunityInfo.toTuple()
+    ).distinct().map(
+      x => {
+        val vd: VertexState = new VertexState()
+        vd.degree = x._2._1
+        vd.randNum = genRandNum(x._1.toInt)
+        vd.currentCommunityInfo = CommunityInfo(x._1)
+        vd.currentCommunityInfo.numEdges = x._2._2
+        vd.currentCommunityInfo.totalDegree = x._2._1
+        (x._1, vd)
+      }
+    )
+    val edgeRdd: RDD[Edge[Int]] = graph.mapTriplets(
+      et=>(et.srcAttr.currentCommunityInfo.communityId, et.dstAttr.currentCommunityInfo.communityId, et.attr)
+    ).edges.filter(x=>x.attr._1!=x.attr._2).map(x=>Edge(x.attr._1, x.attr._2, x.attr._3))
 
-  def run[VD: ClassTag](graph: Graph[VD, Int], maxIter: Int, minDeltaQ: Float,
-                        maxIterStage1: Int, minDeltaQStage1: Float)
-  : Graph[VertexState, Int] = {
+    GraphImpl(VertexRDD[VertexState](vertexRdd), EdgeRDD.fromEdges(edgeRdd)).convertToCanonicalEdges(_+_).cache()
+  }
+
+  def run[VD: ClassTag](graph: Graph[VD, Int], maxIter: Int,
+                        maxIterStage1: Int)
+  : RDD[(VertexId, VertexId)] = {
     var cmGraph: Graph[VertexState, Int] = initLouvain(graph)
     var vertexCommunity: RDD[(VertexId, VertexId)] = cmGraph.vertices.map(x => (x._1, x._2.currentCommunityInfo.communityId))
     var iter: Int = 1
     val loopOuter = new Breaks
     loopOuter.breakable{
       while (iter <= maxIter) {
-        cmGraph = stage1(cmGraph, maxIterStage1, minDeltaQStage1)
+        println("current OUTER iteration: "+iter+", modularity: "+modularity(cmGraph, totWeight))
+        println("---------------------------- START --------------------------------")
+        cmGraph = stage1(cmGraph, maxIterStage1, math.pow(10, -iter-1).toFloat)
+//        cmGraph = stage1(cmGraph, maxIterStage1, minDeltaQStage1)
         vertexCommunity = vertexCommunity.map(
           x=>(x._2, x._1)
         ).leftOuterJoin[VertexId](
           cmGraph.vertices.map(x=>(x._1, x._2.currentCommunityInfo.communityId))
         ).map(x=>(x._2._1, x._2._2.getOrElse(-1L)))
-
+        cmGraph = stage2(cmGraph)
+        println("edge count:" + cmGraph.edges.count())
+        println("---------------------------- END --------------------------------")
         iter += 1
       }
     }
 
-    cmGraph
+    vertexCommunity
   }
 }
