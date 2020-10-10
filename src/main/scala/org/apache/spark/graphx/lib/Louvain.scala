@@ -161,11 +161,11 @@ object Louvain extends Serializable {
     (optimalCommunity, vd.degree, optimalCommunity!=vd.currentCommunityInfo.communityId)
   }
 
-  def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
+  private def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
     totWeight = graph.edges.map(e=>e.attr).reduce(_+_).toFloat
-
     initCommunityGraph(graph).cache()
   }
+
   /**
    * run louvain stage#1
    *
@@ -174,7 +174,7 @@ object Louvain extends Serializable {
    * @param minDeltaQ 每轮迭代Q的最小增加值
    * @return 新的社区划分
    */
-   def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
+   private def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
 
     currentIter = 1
 
@@ -251,7 +251,7 @@ object Louvain extends Serializable {
     currentGraph
   }
 
-  def stage2(graph: Graph[VertexState, Int]): Graph[VertexState, Int] = {
+  private def stage2(graph: Graph[VertexState, Int]): Graph[VertexState, Int] = {
     val vertexRdd: RDD[(VertexId, VertexState)] = graph.vertices.map(
       x => x._2.currentCommunityInfo.toTuple()
     ).distinct().map(
@@ -296,7 +296,6 @@ object Louvain extends Serializable {
         iter += 1
       }
     }
-
     vertexCommunity
   }
 }
