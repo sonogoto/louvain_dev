@@ -29,13 +29,14 @@ object Louvain extends Serializable {
 
   private def initCommunityGraph[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
     // DONE, 聚合两个顶点之间不同方向的边
-
     graph.convertToCanonicalEdges(_+_)
       .outerJoinVertices(graph.degrees)(
         (vid, _, degOpt) => {
           val vertexState = new VertexState()
           vertexState.degree = degOpt.getOrElse(0)
-//          vertexState.numEdges2CurrentCommunity = 0
+          // 在每一轮迭代时，为每个顶点分配一个随机数，
+          // 奇数轮 even顶点 -> odd顶点；偶数轮 odd顶点 -> even顶点
+          // 确保在每一轮迭代时，一个顶点不能即接收又发送消息
           vertexState.randNum = genRandNum(vid.toInt)
           vertexState.currentCommunityInfo = CommunityInfo(vid)
           vertexState.currentCommunityInfo.numEdges = 0
@@ -102,15 +103,6 @@ object Louvain extends Serializable {
     graph.aggregateMessages[Map[VertexId, Int]](sendWeight, mergeWeight)
   }
 
-  // 添加顶点与各个社区的连边数
-  private def addNumEdges(vid: VertexId, vd: Set[CommunityInfo], u: Map[VertexId, Int]): Set[(CommunityInfo, Int)]= {
-    val numEdges = mutable.Set[(CommunityInfo, Int)]()
-    vd.foreach{
-      communityInfo => numEdges.add((communityInfo, u.getOrElse(communityInfo.communityId, 0)))
-    }
-    numEdges.toSet
-  }
-
   private def getNumEdgesWithinCommunity(graph: Graph[(VertexId, Int), Int]): RDD[(VertexId, Int)] = {
     val sendEdgeAttr = (ec: EdgeContext[(VertexId, Int), Int, (VertexId, Int)]) => {
       if (ec.srcAttr._1 == ec.dstAttr._1) ec.sendToSrc((ec.srcAttr._1, ec.attr))
@@ -136,9 +128,9 @@ object Louvain extends Serializable {
    * assign to community which maximize Q
    *
    * @param vid 当前顶点id
-   * @param vd 当前顶点的状态：顶点的度，顶点与当前社区的连边数，当前社区的信息
-   * @param u 当前顶点接收的消息，各个社区的信息，以及当前顶点与该社区的连边数
-   * @return （顶点的度，顶点与新社区的连边数，新社区的id）
+   * @param vd 当前顶点的状态：顶点的度，当前社区的信息
+   * @param u 当前顶点接收的消息，各个社区的信息，以及当前顶点与各社区的连边数
+   * @return （最优社区， 顶点的度， 顶点社区是否发生改变）
    */
   private def selectCommunity(vid: VertexId, vd: VertexState, u: Option[(Set[CommunityInfo], Map[VertexId, Int])]):
   (VertexId, Int, Boolean) = {
@@ -150,7 +142,6 @@ object Louvain extends Serializable {
       u.get._1.foreach{
         x => {
           q = deltaQ(vd, x, numEdgesMap)
-//          println("vid: "+vid+", deltaQ: "+q+", target community: "+x._1+", numEdges to target community: "+x._2)
           if (q > maxQ) {
             maxQ = q
             optimalCommunity = x.communityId
@@ -285,8 +276,8 @@ object Louvain extends Serializable {
       while (iter <= maxIter) {
         println("current OUTER iteration: "+iter+", communities: "+cmGraph.vertices.count()+", modularity: "+modularity(cmGraph, totWeight))
         println("---------------------------- START --------------------------------")
+        // 动态更新minDeltaQ参数，迭代次数越大，minDeltaQ越小
         cmGraph = stage1(cmGraph, maxIterStage1, math.pow(10, -iter-1).toFloat)
-//        cmGraph = stage1(cmGraph, maxIterStage1, minDeltaQStage1)
         vertexCommunity = vertexCommunity.map(
           x=>(x._2, x._1)
         ).leftOuterJoin[VertexId](
