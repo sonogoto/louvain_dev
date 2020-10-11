@@ -265,9 +265,10 @@ object Louvain extends Serializable {
         (x._1, vd)
       }
     )
+    // 包含自环
     val edgeRdd: RDD[Edge[Int]] = graph.mapTriplets(
       et=>(et.srcAttr.currentCommunityInfo.communityId, et.dstAttr.currentCommunityInfo.communityId, et.attr)
-    ).edges.filter(x=>x.attr._1!=x.attr._2).map(x=>Edge(x.attr._1, x.attr._2, x.attr._3))
+    ).edges.map(x=>Edge(x.attr._1, x.attr._2, x.attr._3))
 
     GraphImpl(VertexRDD[VertexState](vertexRdd), EdgeRDD.fromEdges(edgeRdd)).convertToCanonicalEdges(_+_).cache()
   }
@@ -281,7 +282,7 @@ object Louvain extends Serializable {
     val loopOuter = new Breaks
     loopOuter.breakable{
       while (iter <= maxIter) {
-        println("current OUTER iteration: "+iter+", modularity: "+modularity(cmGraph, totWeight))
+        println("current OUTER iteration: "+iter+", communities: "+cmGraph.vertices.count()+", modularity: "+modularity(cmGraph, totWeight))
         println("---------------------------- START --------------------------------")
         cmGraph = stage1(cmGraph, maxIterStage1, math.pow(10, -iter-1).toFloat)
 //        cmGraph = stage1(cmGraph, maxIterStage1, minDeltaQStage1)
