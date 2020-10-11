@@ -238,6 +238,7 @@ object Louvain extends Serializable {
         println("current INNER iteration: "+currentIter+", modularity: "+newModularity)
         if (newModularity < currentModularity + minDeltaQ) {
           println("MODULARITY NOT IMPROVE, BREAK INNER LOOP")
+          // 需要重新创建一个图，否则在下一轮outer迭代计算modularity的时候会报错
           currentGraph = GraphImpl(currentGraph.vertices, currentGraph.edges).cache()
           loopInner.break
         }
