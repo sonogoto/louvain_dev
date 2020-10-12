@@ -19,12 +19,36 @@ object Louvain extends Serializable {
     (48271 * seed) %  255
   }
 
+  private def modularityViaCommunities(communityInfo: RDD[(VertexId, CommunityInfo)], norm: Float): Float = {
+    (communityInfo.map(
+      x=>x._2.numEdges-math.pow(x._2.totalDegree, 2)/(2*norm)
+    ).reduce(_+_)/(2*norm)).toFloat
+  }
+
   private def modularity(graph: Graph[VertexState, Int], norm: Float): Float = {
-    graph.mapTriplets[Float](
-      (edge: EdgeTriplet[VertexState, Int]) =>
-        if (edge.srcAttr.currentCommunityInfo.communityId != edge.dstAttr.currentCommunityInfo.communityId) 0.0f
-        else edge.attr - edge.srcAttr.degree * edge.dstAttr.degree / norm
-    ).edges.reduce((e1, e2) => Edge(attr = e1.attr + e2.attr)).attr / norm
+    // 社区的总度数
+    val totDegreePerCommunity: RDD[(VertexId, Int)] = graph.vertices.values.map(
+      vd=>(vd.currentCommunityInfo.communityId, vd.degree)
+    ).reduceByKey(_+_)
+    // 社区内的连边数
+    val sendEdgeAttr = (ec: EdgeContext[VertexState, Int, (VertexId, Int)]) => {
+      if (ec.srcAttr.currentCommunityInfo.communityId == ec.dstAttr.currentCommunityInfo.communityId)
+        ec.sendToSrc((ec.srcAttr.currentCommunityInfo.communityId, ec.attr))
+    }
+    val numEdgesWithinCommunity: RDD[(VertexId, Int)] =
+      graph.aggregateMessages[(VertexId, Int)](sendEdgeAttr, (x1, x2) => (x1._1, x1._2+x2._2)).values.reduceByKey(_+_)
+    // 社区的总度数和社区内的连边数
+    val communityInfo: RDD[(VertexId, CommunityInfo)] = totDegreePerCommunity.leftOuterJoin(
+      numEdgesWithinCommunity
+    ).map(
+      x => {
+        val cInfo: CommunityInfo = CommunityInfo(x._1)
+        cInfo.totalDegree = x._2._1
+        cInfo.numEdges = x._2._2.getOrElse(0)
+        (x._1, cInfo)
+      }
+    )
+    modularityViaCommunities(communityInfo, norm)
   }
 
   private def initCommunityGraph[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
@@ -159,10 +183,10 @@ object Louvain extends Serializable {
    *
    * @param cmGraph 同上
    * @param maxIter 最大迭代次数
-   * @param minDeltaQ 每轮迭代Q的最小增加值
+   * @param maxIterNoVertexChange 每轮迭代Q的最小增加值
    * @return 新的社区划分
    */
-  def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
+  def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, maxIterNoVertexChange: Int): Graph[VertexState, Int] = {
 
     currentIter = 1
 
@@ -191,8 +215,8 @@ object Louvain extends Serializable {
         val numVerticesChangedCommunity: Long = tmpGraph.vertices.filter(x=>x._2._3).count()
         if (numVerticesChangedCommunity < 1L) {
           numItersNoVertexChange += 1
-          if (numItersNoVertexChange >= 4) {
-            println("NO VERTEX CHANGE COMMUNITY, BREAK INNER LOOP")
+          if (numItersNoVertexChange >= maxIterNoVertexChange) {
+            println("NO VERTEX CHANGE COMMUNITY IN THE LAST "+maxIterNoVertexChange+" ITERATIONS, BREAK INNER LOOP")
             // 需要重新创建一个图，否则在下一轮outer迭代计算modularity的时候会报错
             currentGraph = GraphImpl(currentGraph.vertices, currentGraph.edges).cache()
             loopInner.break
@@ -216,10 +240,22 @@ object Louvain extends Serializable {
             cInfo.numEdges = x._2._2.getOrElse(0)
             (x._1, cInfo)
           }
-        )
+        ).cache()
+
+        val newModularity: Float = modularityViaCommunities(communityInfo, totWeight)
+        println("current INNER iteration: "+currentIter+", modularity: "+newModularity)
+        if (newModularity < currentModularity) {
+          println("MODULARITY DESCEND, BREAK INNER LOOP")
+          // 需要重新创建一个图，否则在下一轮outer迭代计算modularity的时候会报错
+          currentGraph = GraphImpl(currentGraph.vertices, currentGraph.edges).cache()
+          loopInner.break
+        }
+        currentModularity = newModularity
+
         val vertexCommunityInfo: RDD[(VertexId, CommunityInfo)] = intermediateGraph.vertices.map(
           x => (x._2._1, x._1)
         ).join(communityInfo).map(x => x._2)
+        communityInfo.unpersist(false)
         intermediateGraph.unpersist()
         // 为顶点分配新的社区id
         newGraph = currentGraph.outerJoinVertices(
@@ -232,17 +268,6 @@ object Louvain extends Serializable {
           }
         )
         newGraph = GraphImpl(newGraph.vertices, newGraph.edges).cache()
-
-        val newModularity: Float = modularity(newGraph, totWeight)
-        println("current INNER iteration: "+currentIter+", modularity: "+newModularity)
-        if (newModularity < currentModularity + minDeltaQ) {
-          println("MODULARITY NOT IMPROVE, BREAK INNER LOOP")
-          // 需要重新创建一个图，否则在下一轮outer迭代计算modularity的时候会报错
-          currentGraph = GraphImpl(currentGraph.vertices, currentGraph.edges).cache()
-          loopInner.break
-        }
-        currentModularity = newModularity
-
         currentGraph = newGraph
 
         currentIter += 1
@@ -274,7 +299,7 @@ object Louvain extends Serializable {
   }
 
   def run[VD: ClassTag](graph: Graph[VD, Int], maxIter: Int,
-                        maxIterStage1: Int)
+                        maxIterStage1: Int, maxIterNoVertexChangeStage1: Int = 4)
   : RDD[(VertexId, VertexId)] = {
     var cmGraph: Graph[VertexState, Int] = initLouvain(graph)
     var vertexCommunity: RDD[(VertexId, VertexId)] = cmGraph.vertices.map(x => (x._1, x._2.currentCommunityInfo.communityId))
@@ -285,7 +310,7 @@ object Louvain extends Serializable {
         println("current OUTER iteration: "+iter+", communities: "+cmGraph.vertices.count()+", modularity: "+modularity(cmGraph, totWeight))
         println("---------------------------- START --------------------------------")
         // 动态更新minDeltaQ参数，迭代次数越大，minDeltaQ越小
-        cmGraph = stage1(cmGraph, maxIterStage1, 0f)
+        cmGraph = stage1(cmGraph, maxIterStage1, maxIterNoVertexChangeStage1)
         vertexCommunity = vertexCommunity.map(
           x=>(x._2, x._1)
         ).leftOuterJoin[VertexId](
