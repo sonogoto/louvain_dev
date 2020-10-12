@@ -55,8 +55,12 @@ object Louvain extends Serializable {
    */
   private def sendMsg(ec: EdgeContext[VertexState, Int, Set[CommunityInfo]]): Unit = {
     if (ec.srcAttr.currentCommunityInfo.communityId != ec.dstAttr.currentCommunityInfo.communityId) {
-      val srcNotChangedYet: Boolean = ec.srcId == ec.srcAttr.currentCommunityInfo.communityId
-      val dstNotChangedYet: Boolean = ec.dstId == ec.dstAttr.currentCommunityInfo.communityId
+      // 检查顶点的社区是否改变，或者有其他顶点加入到此顶点社区
+      // 1) 如果此顶点的社区已改变，即此顶点已经移动过，则不再移动此顶点
+      // 2) 如果此有其他顶点加入到此顶点社区，则不移动此顶点（否则会出现A属于B社区，而B属于C社区），
+      // 但其他顶点仍然可以继续加入到此顶点社区
+      val srcNotChangedYet: Boolean = ec.srcAttr.degree == ec.srcAttr.currentCommunityInfo.totalDegree
+      val dstNotChangedYet: Boolean = ec.dstAttr.degree == ec.dstAttr.currentCommunityInfo.totalDegree
       currentIter % 2 match {
         // odd -> even
         case 0 =>
