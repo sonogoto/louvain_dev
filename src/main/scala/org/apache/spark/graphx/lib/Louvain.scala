@@ -55,18 +55,20 @@ object Louvain extends Serializable {
    */
   private def sendMsg(ec: EdgeContext[VertexState, Int, Set[CommunityInfo]]): Unit = {
     if (ec.srcAttr.currentCommunityInfo.communityId != ec.dstAttr.currentCommunityInfo.communityId) {
+      val srcNotChangedYet: Boolean = ec.srcId == ec.srcAttr.currentCommunityInfo.communityId
+      val dstNotChangedYet: Boolean = ec.dstId == ec.dstAttr.currentCommunityInfo.communityId
       currentIter % 2 match {
         // odd -> even
         case 0 =>
-          if (ec.srcAttr.randNum % 2 == 1 && ec.dstAttr.randNum % 2 == 0)
+          if (ec.srcAttr.randNum % 2 == 1 && ec.dstAttr.randNum % 2 == 0 && dstNotChangedYet)
             ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))
-          else if (ec.srcAttr.randNum % 2 == 0 && ec.dstAttr.randNum % 2 == 1)
+          else if (ec.srcAttr.randNum % 2 == 0 && ec.dstAttr.randNum % 2 == 1 && srcNotChangedYet)
             ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))
         // even -> odd
         case 1 =>
-          if (ec.srcAttr.randNum % 2 == 1 && ec.dstAttr.randNum % 2 == 0)
+          if (ec.srcAttr.randNum % 2 == 1 && ec.dstAttr.randNum % 2 == 0 && srcNotChangedYet)
             ec.sendToSrc(Set(ec.dstAttr.currentCommunityInfo))
-          else if (ec.srcAttr.randNum % 2 == 0 && ec.dstAttr.randNum % 2 == 1)
+          else if (ec.srcAttr.randNum % 2 == 0 && ec.dstAttr.randNum % 2 == 1 && dstNotChangedYet)
             ec.sendToDst(Set(ec.srcAttr.currentCommunityInfo))
         case _ => Unit
       }
@@ -111,17 +113,8 @@ object Louvain extends Serializable {
   }
 
   private def deltaQ(originalState: VertexState, targetCom: CommunityInfo, numEdges: Map[VertexId, Int]): Float = {
-    // deltaQ1：顶点从原社区剥离之后，原社区Q的变化
-    // deltaQ1 = sum_{j in community}(degree_{j})*degree_{i}/totWeight - numEdges_{i} - degree_{i}*degree_{i}/(2*totWeight)
-    val deltaQ1: Float = originalState.currentCommunityInfo.totalDegree*originalState.degree/totWeight -
-      numEdges.getOrElse(originalState.currentCommunityInfo.communityId, 0) -
-      originalState.degree*originalState.degree/(2*totWeight)
-    // deltaQ2：顶点加入新社区之后，新社区Q的变化
-    // deltaQ2 = numEdges_{i} - degree_{i}*degree_{i}/(2*totWeight) - sum_{j in community}(degree_{j})*degree_{i}/totWeight
-    val deltaQ2: Float = numEdges.getOrElse(targetCom.communityId, 0) -
-      originalState.degree*originalState.degree/(2*totWeight) -
-      targetCom.totalDegree*originalState.degree/totWeight
-    deltaQ1 + deltaQ2
+    // 新的顶点移动策略下（每一轮只移动未曾移动的顶点），deltaQ的简化计算
+    (numEdges.getOrElse(targetCom.communityId, 0)-targetCom.totalDegree*originalState.degree/totWeight)/(2*totWeight)
   }
 
   /**
@@ -152,7 +145,7 @@ object Louvain extends Serializable {
     (optimalCommunity, vd.degree, optimalCommunity!=vd.currentCommunityInfo.communityId)
   }
 
-  private def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
+  def initLouvain[VD: ClassTag](graph: Graph[VD, Int]): Graph[VertexState, Int] = {
     totWeight = graph.edges.map(e=>e.attr).reduce(_+_).toFloat
     initCommunityGraph(graph).cache()
   }
@@ -165,7 +158,7 @@ object Louvain extends Serializable {
    * @param minDeltaQ 每轮迭代Q的最小增加值
    * @return 新的社区划分
    */
-   private def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
+  def stage1(cmGraph: Graph[VertexState, Int], maxIter: Int, minDeltaQ: Float): Graph[VertexState, Int] = {
 
     currentIter = 1
 
@@ -174,6 +167,7 @@ object Louvain extends Serializable {
     val loopInner = new Breaks
     var currentModularity: Float = modularity(currentGraph, totWeight)
     loopInner.breakable {
+      var numItersNoVertexChange: Int = 0
       while (currentIter <= maxIter) {
         val msgRdd: VertexRDD[Set[CommunityInfo]] = currentGraph.aggregateMessages[Set[CommunityInfo]](sendMsg, _++_).cache()
         // VD: Map[VertexId, Int], communityId -> numEdges
@@ -190,7 +184,17 @@ object Louvain extends Serializable {
         // 临时结果，包括顶点分配的新社区、顶点的度以及顶点的社区是否改变
         // VD: (VertexId, Int, Boolean) : (communityId, vertexDegree, isChanged)
         val tmpGraph: Graph[(VertexId, Int, Boolean), Int] = currentGraph.outerJoinVertices(msgRddWithNumEdges)(selectCommunity)
-        println(tmpGraph.vertices.filter(x=>x._2._3).count() + " vertices will update communities")
+        val numVerticesChangedCommunity: Long = tmpGraph.vertices.filter(x=>x._2._3).count()
+        if (numVerticesChangedCommunity < 1L) {
+          numItersNoVertexChange += 1
+          if (numItersNoVertexChange >= 4) {
+            println("NO VERTEX CHANGE COMMUNITY, BREAK INNER LOOP")
+            // 需要重新创建一个图，否则在下一轮outer迭代计算modularity的时候会报错
+            currentGraph = GraphImpl(currentGraph.vertices, currentGraph.edges).cache()
+            loopInner.break
+          }
+        } else numItersNoVertexChange = 0
+        println(numVerticesChangedCommunity + " vertices will update communities")
         // 中间结果，包括顶点分配的新社区、顶点的度
         // VD: (VertexId, Int) : (communityId, vertexDegree)
         val intermediateGraph: Graph[(VertexId, Int), Int] = tmpGraph.mapVertices((vid, vd)=>(vd._1, vd._2)).cache()
@@ -243,7 +247,7 @@ object Louvain extends Serializable {
     currentGraph
   }
 
-  private def stage2(graph: Graph[VertexState, Int]): Graph[VertexState, Int] = {
+  def stage2(graph: Graph[VertexState, Int]): Graph[VertexState, Int] = {
     val vertexRdd: RDD[(VertexId, VertexState)] = graph.vertices.map(
       x => x._2.currentCommunityInfo.toTuple()
     ).distinct().map(
@@ -277,7 +281,7 @@ object Louvain extends Serializable {
         println("current OUTER iteration: "+iter+", communities: "+cmGraph.vertices.count()+", modularity: "+modularity(cmGraph, totWeight))
         println("---------------------------- START --------------------------------")
         // 动态更新minDeltaQ参数，迭代次数越大，minDeltaQ越小
-        cmGraph = stage1(cmGraph, maxIterStage1, math.pow(10, -iter-1).toFloat)
+        cmGraph = stage1(cmGraph, maxIterStage1, 0f)
         vertexCommunity = vertexCommunity.map(
           x=>(x._2, x._1)
         ).leftOuterJoin[VertexId](
